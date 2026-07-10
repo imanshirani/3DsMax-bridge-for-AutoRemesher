@@ -91,4 +91,4 @@ The result is imported back into the scene as `<original_name>_remeshed`, placed
 
 ## License
 
-MIT License — © 2025 Iman Shirani
+MIT License — © 2026 Iman Shirani
