@@ -31,44 +31,27 @@ A Python + PySide6 plugin that connects [huxingyi/autoremesher](https://github.c
 | PySide6 | install via Max's pip |
 | autoremesher CLI | [download here](https://github.com/huxingyi/autoremesher/releases) |
 
-### Install PySide6 inside 3ds Max
 
-Open the MAXScript Listener, switch to the **Python** tab and run:
-
-```python
-import subprocess, sys
-subprocess.run([sys.executable, "-m", "pip", "install", "PySide6"])
-```
 
 ---
 
-## Installation
+## 📦 Installation
 
-1. Download `autoremesher_bridge.py` and place it anywhere on your machine.
-2. Download `autoremesher.exe` from the [autoremesher releases page](https://github.com/huxingyi/autoremesher/releases).
+1. Copy the project folder to your **3ds Max scripts** directory.
+2. Launch `autoremesher_bridge.py` from the **Scripting > Run Script...** menu.
+3. Set your material root folder from **Settings**.
 
----
+or
 
-## Usage
+## 📦 Installation
 
-### Option A — MAXScript Listener (Python tab)
+Installing the plugin is quick and requires no manual setup in 3ds Max.
 
-```python
-import importlib, sys
-sys.path.insert(0, r"C:\path\to\autoremesher_bridge")
-import autoremesher_bridge
-importlib.reload(autoremesher_bridge)
-autoremesher_bridge.launch()
-```
-
-### Option B — Run as script on startup / toolbar button
-
-Create a MAXScript file with the following content and assign it to a toolbar button or run it from the editor:
-
-```maxscript
-python.ExecuteFile @"C:\path\to\autoremesher_bridge.py"
-```
-
+1. **Unzip** the downloaded package.
+2. **Copy** the `.bundle` folder to the Autodesk Application Plugins directory:
+   ```text
+   C:\ProgramData\Autodesk\ApplicationPlugins
+   
 ---
 
 ## Parameters
