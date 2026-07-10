@@ -3,12 +3,6 @@ AutoRemesher Bridge for 3ds Max
 ────────────────────────────────
 Python 3 + PySide6 UI that wraps the autoremesher CLI tool.
 
-Run inside 3ds Max's Python interpreter (MAXScript Listener → Python tab):
-    import importlib, sys
-    sys.path.insert(0, r"F:\\3DSMAX-PLUGINS\\Automatic quad remeshing tool\\Automatic quad remeshing tool")
-    import autoremesher_bridge
-    importlib.reload(autoremesher_bridge)
-    autoremesher_bridge.launch()
 """
 
 from __future__ import annotations
@@ -19,29 +13,13 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+
 from PySide6.QtCore import QSettings, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QComboBox,
-    QDialog,
-    QDoubleSpinBox,
-    QFileDialog,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QMessageBox,
-    QProgressBar,
-    QPushButton,
-    QSizePolicy,
-    QSlider,
-    QSpinBox,
-    QStatusBar,
-    QVBoxLayout,
-    QWidget,
+from PySide6.QtWidgets import ( QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
+                               QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, 
+                               QPushButton, QSizePolicy, QSlider, QSpinBox, QStatusBar, QVBoxLayout, QWidget 
 )
 
 try:
@@ -229,7 +207,9 @@ class RemeshWorker(QThread):
         self.edge_scaling = edge_scaling
 
     def run(self):
+        print("[AR] worker.run() entered")
         self.progress.emit(30, "Running AutoRemesher…")
+        print("[AR] progress(30) emitted")
         cmd = [
             self.exe_path,
             "--input",        self.in_file,
@@ -240,12 +220,12 @@ class RemeshWorker(QThread):
             "--adaptivity",    f"{self.adaptivity:.4f}",
             "--edge-scaling",  f"{self.edge_scaling:.4f}",
         ]
-        print("[AutoRemesher] CMD:", " ".join(cmd))
+        print(f"[AR] subprocess.run: {' '.join(cmd)}")
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            print("[AutoRemesher] exit code:", result.returncode)
-            print("[AutoRemesher] stdout:", result.stdout.strip())
-            print("[AutoRemesher] stderr:", result.stderr.strip())
+            print(f"[AR] subprocess done — exit={result.returncode}")
+            if result.stderr.strip():
+                print(f"[AR] stderr: {result.stderr.strip()}")
         except FileNotFoundError:
             self.finished.emit(False, f"Executable not found:\n{self.exe_path}")
             return
@@ -268,8 +248,10 @@ class RemeshWorker(QThread):
             self.finished.emit(False, "AutoRemesher finished but no output file was created.")
             return
 
+        print("[AR] emitting progress(80) and finished(True)")
         self.progress.emit(80, "Importing result…")
         self.finished.emit(True, "")
+        print("[AR] worker.run() done")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -286,29 +268,87 @@ def _max_selected_name() -> str | None:
 
 
 def _max_export_obj(obj_name: str, file_path: str) -> bool:
+    """Write OBJ directly from pymxs mesh data — no rt.select() needed."""
     if not _IN_MAX:
         return False
-    rt = pymxs.runtime
+    rt   = pymxs.runtime
+    print(f"[AR] export: getNodeByName '{obj_name}'")
     node = rt.getNodeByName(obj_name)
     if node is None:
+        print("[AR] export: node not found")
         return False
-    rt.select(node)
-    rt.exportFile(file_path, rt.name("noPrompt"), selectedOnly=True)
-    rt.deselect(node)
-    return Path(file_path).exists()
+
+    print(f"[AR] export: snapshotAsMesh...")
+    mesh = rt.snapshotAsMesh(node)
+    if mesh is None:
+        print("[AR] export: snapshotAsMesh returned None")
+        return False
+
+    nv = rt.getNumVerts(mesh)
+    print(f"[AR] export: verts={nv}")
+
+    # Export in local (object) space, converted to OBJ Y-up convention.
+    # Max Z-up local (x, y, z) → OBJ Y-up (x, z, -y).
+    # World transform is NOT baked in — it is re-applied after import
+    # by copying the original node's transform matrix.
+    raw_verts = []
+    for i in range(1, nv + 1):
+        v = rt.getVert(mesh, i)
+        raw_verts.append((v.x, v.z, -v.y))
+
+    # Weld coincident vertices in Python (fixes non-manifold seams like Teapot)
+    PREC = 4
+    key_to_new = {}
+    new_verts  = []
+    old_to_new = {}
+    for old_i, pos in enumerate(raw_verts, start=1):
+        key = (round(pos[0], PREC), round(pos[1], PREC), round(pos[2], PREC))
+        if key not in key_to_new:
+            new_verts.append(pos)
+            key_to_new[key] = len(new_verts)
+        old_to_new[old_i] = key_to_new[key]
+    print(f"[AR] export: {nv} verts → {len(new_verts)} after weld")
+
+    lines = []
+    for (x, y, z) in new_verts:
+        lines.append(f"v {x} {y} {z}")
+
+    nf      = rt.getNumFaces(mesh)
+    skipped = 0
+    print(f"[AR] export: faces={nf}")
+    for i in range(1, nf + 1):
+        f  = rt.getFace(mesh, i)
+        vi = (old_to_new[int(f.x)], old_to_new[int(f.y)], old_to_new[int(f.z)])
+        if vi[0] == vi[1] or vi[1] == vi[2] or vi[0] == vi[2]:
+            skipped += 1
+            continue
+        lines.append(f"f {vi[0]} {vi[1]} {vi[2]}")
+    if skipped:
+        print(f"[AR] export: skipped {skipped} degenerate faces")
+
+    # Do NOT call rt.delete(mesh) — TriMesh value is not a scene node;
+    # delete() on it triggers DirtyNotificationEventMonitor.
+    Path(file_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    size = Path(file_path).stat().st_size
+    print(f"[AR] export: done — size={size}")
+    return size > 0
 
 
 def _max_import_obj(file_path: str, origin_name: str) -> str | None:
     if not _IN_MAX:
         return None
     rt = pymxs.runtime
+    new_name     = origin_name + "_remeshed"
+    origin_node  = rt.getNodeByName(origin_name)
     before_names = {str(n.name) for n in rt.objects}
     rt.importFile(file_path, rt.name("noPrompt"))
-    new_name = origin_name + "_remeshed"
     for n in rt.objects:
         if str(n.name) not in before_names:
             n.name = new_name
-            rt.select(n)
+            # OBJ import applies a Y-up→Z-up rotation; undo it by
+            # overwriting with the original node's world transform.
+            if origin_node is not None:
+                n.transform = origin_node.transform
             break
     return new_name
 
@@ -525,12 +565,15 @@ class PathRow(QWidget):
         row.addWidget(btn)
 
     def _browse(self):
+        current = self.edit.text().strip()
         if self._mode == "file":
+            start_dir = str(Path(current).parent) if current and Path(current).parent.exists() else ""
             path, _ = QFileDialog.getOpenFileName(
-                self, "Select autoremesher.exe", "", "Executable (*.exe);;All Files (*)"
+                self, "Select autoremesher.exe", start_dir, "Executable (*.exe);;All Files (*)"
             )
         else:
-            path = QFileDialog.getExistingDirectory(self, "Select Temp Folder")
+            start_dir = current if current and Path(current).exists() else ""
+            path = QFileDialog.getExistingDirectory(self, "Select Temp Folder", start_dir)
         if path:
             self.edit.setText(path)
 
@@ -560,6 +603,9 @@ class AutoRemesherWindow(QMainWindow):
 
         self._build_ui()
         self._load_settings()
+        # Save exe/tmp paths immediately when user changes them
+        self.row_exe.edit.editingFinished.connect(self._save_settings)
+        self.row_tmp.edit.editingFinished.connect(self._save_settings)
 
     def _build_ui(self):
         root = QWidget()
@@ -605,6 +651,7 @@ class AutoRemesherWindow(QMainWindow):
         gp.addWidget(self.row_exe)
         gp.addWidget(self.row_tmp)
         vbox.addWidget(grp_path)
+
 
         # Settings
         grp_set = QGroupBox("Remesh Settings")
@@ -686,6 +733,7 @@ class AutoRemesherWindow(QMainWindow):
         self._settings.setValue("edge_scaling",self.sld_edge.value)
         self._settings.setValue("keep_orig",   self.chk_keep.isChecked())
         self._settings.setValue("uv_mode",     self.cmb_uv.currentIndex())
+        self._settings.sync()  # flush to disk/registry immediately
 
     def _on_remesh(self):
         exe = self.row_exe.value
@@ -708,26 +756,41 @@ class AutoRemesherWindow(QMainWindow):
         in_file  = str(tmp_dir / "input.obj")
         out_file = str(tmp_dir / "output.obj")
 
-        if Path(out_file).exists():
-            Path(out_file).unlink()
+        for stale in (in_file, out_file):
+            try:
+                if Path(stale).exists():
+                    Path(stale).unlink()
+            except OSError:
+                pass
 
         self._set_status("Exporting mesh…")
         self.progress.setValue(10)
-        QApplication.processEvents()
+        self._set_worker_running(True)
+        self._save_settings()
 
+        # Defer the export+launch outside the Qt button-click event frame.
+        # snapshotAsMesh called directly inside a Qt slot triggers
+        # DirtyNotificationEventMonitor — deferring to the next event loop
+        # iteration keeps pymxs calls outside any active Qt event handler.
+        QTimer.singleShot(0, lambda: self._deferred_export_and_start(
+            obj_name, in_file, out_file, exe))
+
+    def _deferred_export_and_start(self, obj_name: str, in_file: str,
+                                    out_file: str, exe: str):
+        print(f"[AR] --- Remesh started: {obj_name} ---")
+        print("[AR] calling export...")
         if _IN_MAX:
             if not _max_export_obj(obj_name, in_file):
                 self._set_status("Export failed. Is the mesh valid geometry?", error=True)
                 self.progress.setValue(0)
+                self._set_worker_running(False)
                 return
         else:
             Path(in_file).write_text(
                 "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\n"
                 "f 1 2 3\nf 1 2 4\nf 1 3 4\nf 2 3 4\n"
             )
-
-        self._save_settings()
-        self._set_worker_running(True)
+        print("[AR] export done, starting worker...")
 
         self._worker = RemeshWorker(
             exe_path     = exe,
@@ -744,6 +807,7 @@ class AutoRemesherWindow(QMainWindow):
             lambda ok, msg: QTimer.singleShot(0, lambda: self._on_finished(ok, msg))
         )
         self._worker.start()
+        print(f"[AR] worker started, isRunning={self._worker.isRunning()}")
 
     def _on_progress(self, value: int, msg: str):
         self.progress.setValue(value)
@@ -820,6 +884,26 @@ class AutoRemesherWindow(QMainWindow):
 _window_ref: AutoRemesherWindow | None = None
 
 
+def _preload_obj_plugin():
+    """
+    Force IOBJEXP to load before the Qt event loop is active.
+    First call triggers plugin DLL load + possible UI init — must happen
+    outside any Qt slot, otherwise Max and Qt deadlock each other.
+    """
+    if not _IN_MAX:
+        return
+    try:
+        import tempfile, os
+        rt = pymxs.runtime
+        tmp = os.path.join(tempfile.gettempdir(), "_ar_preload_.obj")
+        # Export an empty selection — just enough to force the DLL to load
+        rt.exportFile(tmp, rt.name("noPrompt"), selectedOnly=True)
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    except Exception:
+        pass  # silently ignore — worst case first real export is still slow
+
+
 def launch():
     """Open / re-open the bridge window from inside 3ds Max.
 
@@ -827,6 +911,8 @@ def launch():
     QApplication or call app.exec() here.
     """
     global _window_ref
+
+    _preload_obj_plugin()   # load IOBJEXP DLL before Qt event loop takes over
 
     if _window_ref is not None:
         try:
