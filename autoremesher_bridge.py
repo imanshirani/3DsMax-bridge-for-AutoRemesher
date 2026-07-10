@@ -222,15 +222,12 @@ class RemeshWorker(QThread):
         ]
         print(f"[AR] subprocess.run: {' '.join(cmd)}")
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            result = subprocess.run(cmd, capture_output=True, text=True)
             print(f"[AR] subprocess done — exit={result.returncode}")
             if result.stderr.strip():
                 print(f"[AR] stderr: {result.stderr.strip()}")
         except FileNotFoundError:
             self.finished.emit(False, f"Executable not found:\n{self.exe_path}")
-            return
-        except subprocess.TimeoutExpired:
-            self.finished.emit(False, "AutoRemesher timed out after 5 minutes.")
             return
         except Exception as exc:
             self.finished.emit(False, f"Unexpected error:\n{exc}")
@@ -284,17 +281,34 @@ def _max_export_obj(obj_name: str, file_path: str) -> bool:
         print("[AR] export: snapshotAsMesh returned None")
         return False
 
+    tm = node.transform
     nv = rt.getNumVerts(mesh)
     print(f"[AR] export: verts={nv}")
 
-    # Export in local (object) space, converted to OBJ Y-up convention.
-    # Max Z-up local (x, y, z) → OBJ Y-up (x, z, -y).
-    # World transform is NOT baked in — it is re-applied after import
-    # by copying the original node's transform matrix.
+    # Export in LOCAL space with Z-up → Y-up conversion: (lx, ly, lz) → (lx, lz, -ly).
+    # Max OBJ importer undoes this on read: (ox, oy, oz) → Max (ox, -oz, oy).
+    # After import we copy the original node's full transform (pos+rot+scale),
+    # so the result lands exactly on top of the original.
+    pos = node.position
+    print(f"[AR] export: pivot  X={pos.x:.3f}  Y={pos.y:.3f}  Z={pos.z:.3f}")
+    # snapshotAsMesh returns world-space vertices.
+    # Max OBJ importer does a plain Y↔Z swap on read.
+    # So we write (x, z, y) — the same Y↔Z swap — so that after the importer
+    # swaps them back the vertices land at the original world positions.
     raw_verts = []
+    xs_w, ys_w, zs_w = [], [], []
     for i in range(1, nv + 1):
         v = rt.getVert(mesh, i)
-        raw_verts.append((v.x, v.z, -v.y))
+        xs_w.append(v.x); ys_w.append(v.y); zs_w.append(v.z)
+        raw_verts.append((v.x, v.z, v.y))
+
+    if xs_w:
+        print(f"[AR] export: origin size   X={max(xs_w)-min(xs_w):.3f}"
+              f"  Y={max(ys_w)-min(ys_w):.3f}  Z={max(zs_w)-min(zs_w):.3f}")
+        cx = (max(xs_w)+min(xs_w))/2
+        cy = (max(ys_w)+min(ys_w))/2
+        cz = (max(zs_w)+min(zs_w))/2
+        print(f"[AR] export: mesh center   X={cx:.3f}  Y={cy:.3f}  Z={cz:.3f}")
 
     # Weld coincident vertices in Python (fixes non-manifold seams like Teapot)
     PREC = 4
@@ -322,7 +336,8 @@ def _max_export_obj(obj_name: str, file_path: str) -> bool:
         if vi[0] == vi[1] or vi[1] == vi[2] or vi[0] == vi[2]:
             skipped += 1
             continue
-        lines.append(f"f {vi[0]} {vi[1]} {vi[2]}")
+        # Y↔Z swap changes coordinate handedness — reverse winding to keep normals outward
+        lines.append(f"f {vi[0]} {vi[2]} {vi[1]}")
     if skipped:
         print(f"[AR] export: skipped {skipped} degenerate faces")
 
@@ -338,18 +353,36 @@ def _max_import_obj(file_path: str, origin_name: str) -> str | None:
     if not _IN_MAX:
         return None
     rt = pymxs.runtime
-    new_name     = origin_name + "_remeshed"
-    origin_node  = rt.getNodeByName(origin_name)
+    new_name    = origin_name + "_remeshed"
+    origin_node = rt.getNodeByName(origin_name)
+
     before_names = {str(n.name) for n in rt.objects}
     rt.importFile(file_path, rt.name("noPrompt"))
+    imported = None
     for n in rt.objects:
         if str(n.name) not in before_names:
             n.name = new_name
-            # OBJ import applies a Y-up→Z-up rotation; undo it by
-            # overwriting with the original node's world transform.
-            if origin_node is not None:
-                n.transform = origin_node.transform
+            imported = n
             break
+
+    # Vertices were exported in world space — no transform manipulation needed.
+
+    safe = new_name.replace('"', '\\"')
+    rt.execute(f'''(
+        local n = getNodeByName "{safe}"
+        if n != undefined do (
+            local bb = nodeGetBoundingBox n (matrix3 1)
+            local szx = bb[2].x-bb[1].x
+            local szy = bb[2].y-bb[1].y
+            local szz = bb[2].z-bb[1].z
+            local cx = (bb[1].x+bb[2].x)/2.0
+            local cy = (bb[1].y+bb[2].y)/2.0
+            local cz = (bb[1].z+bb[2].z)/2.0
+            format "[AR] import: result size   X=% Y=% Z=%\\n" szx szy szz
+            format "[AR] import: mesh center   X=% Y=% Z=%\\n" cx cy cz
+            format "[AR] import: pivot         X=% Y=% Z=%\\n" n.position.x n.position.y n.position.z
+        )
+    )''')
     return new_name
 
 
@@ -884,26 +917,6 @@ class AutoRemesherWindow(QMainWindow):
 _window_ref: AutoRemesherWindow | None = None
 
 
-def _preload_obj_plugin():
-    """
-    Force IOBJEXP to load before the Qt event loop is active.
-    First call triggers plugin DLL load + possible UI init — must happen
-    outside any Qt slot, otherwise Max and Qt deadlock each other.
-    """
-    if not _IN_MAX:
-        return
-    try:
-        import tempfile, os
-        rt = pymxs.runtime
-        tmp = os.path.join(tempfile.gettempdir(), "_ar_preload_.obj")
-        # Export an empty selection — just enough to force the DLL to load
-        rt.exportFile(tmp, rt.name("noPrompt"), selectedOnly=True)
-        if os.path.exists(tmp):
-            os.remove(tmp)
-    except Exception:
-        pass  # silently ignore — worst case first real export is still slow
-
-
 def launch():
     """Open / re-open the bridge window from inside 3ds Max.
 
@@ -911,8 +924,6 @@ def launch():
     QApplication or call app.exec() here.
     """
     global _window_ref
-
-    _preload_obj_plugin()   # load IOBJEXP DLL before Qt event loop takes over
 
     if _window_ref is not None:
         try:
