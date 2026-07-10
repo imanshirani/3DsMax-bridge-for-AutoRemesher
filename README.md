@@ -1,0 +1,1 @@
+# 3DsMax-bridge-for-AutoRemesher
