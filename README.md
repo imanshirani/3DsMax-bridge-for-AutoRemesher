@@ -10,6 +10,9 @@ A Python + PySide6 plugin that connects [huxingyi/autoremesher](https://github.c
 
 ---
 ![screenshot](etc/UI.png)
+
+![screenshot](etc/S1.png)
+
 ---
 
 ## Features
