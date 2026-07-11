@@ -1,6 +1,6 @@
 # AutoRemesher Bridge for 3ds Max
 
-A Python + PySide6 plugin that connects [huxingyi/autoremesher](https://github.com/huxingyi/autoremesher) to **3ds Max**, giving you a dark-themed floating UI to quad-remesh any mesh without leaving Max.
+A Python + PySide6 Script that connects [huxingyi/autoremesher](https://github.com/huxingyi/autoremesher) to **3ds Max**, giving you a dark-themed floating UI to quad-remesh any mesh without leaving Max.
 
 [![Donate ❤️](https://img.shields.io/badge/Donate-PayPal-00457C?style=flat-square&logo=paypal&logoColor=white)](https://www.paypal.com/donate/?hosted_button_id=LAMNRY6DDWDC4)
 ![3dsmax](https://img.shields.io/badge/Autodesk-3ds%20Max-0696D7?style=flat-square&logo=autodesk)
